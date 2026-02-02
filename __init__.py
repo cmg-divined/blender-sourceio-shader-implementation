@@ -414,6 +414,12 @@ class VLGMaterialProperties(PropertyGroup):
         default=0.5
     )
     
+    allowalphatocoverage: BoolProperty(
+        name="Allow Alpha to Coverage",
+        description="$allowalphatocoverage - Softer alpha edges (uses dithered transparency)",
+        default=False
+    )
+    
     additive: BoolProperty(
         name="Additive",
         description="$additive - Additive blending mode",
@@ -1284,27 +1290,75 @@ def apply_vlg_material(material, props):
     # TRANSPARENCY
     # -------------------------------------------------------------------------
     if props.translucent or props.alphatest:
-        # Set blend method (check for Blender 4.3+ where some properties changed)
-        if hasattr(material, 'blend_method'):
-            material.blend_method = 'BLEND' if props.translucent else 'CLIP'
-        
-        # shadow_method was removed in Blender 4.3+
-        if hasattr(material, 'shadow_method'):
-            material.shadow_method = 'CLIP' if props.alphatest else 'HASHED'
-        
-        # For Blender 4.x Eevee, set the surface render method
-        if hasattr(material, 'surface_render_method'):
-            material.surface_render_method = 'BLENDED'
-        
-        if props.alphatest and hasattr(material, 'alpha_threshold'):
-            material.alpha_threshold = props.alphatestreference
-        
-        # Connect alpha to Principled BSDF for proper transparency
-        if props.basetexture and base_tex_node:
-            if props.translucent and not props.alphatest:
-                # For translucent materials, clean up alpha to remove halo artifacts
-                # Use a simple approach: if alpha < threshold, make it 0
+        # For alphatest materials
+        if props.alphatest and props.basetexture and base_tex_node:
+            # Check if the base texture actually has alpha data
+            has_alpha = False
+            if base_tex_node.image:
+                img = base_tex_node.image
+                print(f"[VLG DEBUG] Base texture: {img.name}")
+                print(f"[VLG DEBUG] Channels: {img.channels}, Depth: {img.depth}")
+                print(f"[VLG DEBUG] Alpha mode: {img.alpha_mode}")
+                has_alpha = img.channels == 4
                 
+                if not has_alpha:
+                    print(f"[VLG WARNING] Base texture has no alpha channel ({img.channels} channels)")
+            
+            # Check if $allowalphatocoverage is enabled (softer edges)
+            if props.allowalphatocoverage:
+                # Use HASHED blend mode for soft dithered edges (similar to alpha-to-coverage)
+                print(f"[VLG DEBUG] Using HASHED mode for $allowalphatocoverage (soft edges)")
+                if hasattr(material, 'blend_method'):
+                    material.blend_method = 'HASHED'
+                if hasattr(material, 'shadow_method'):
+                    material.shadow_method = 'HASHED'
+                
+                # Connect alpha directly - HASHED mode handles soft dithering
+                links.new(base_tex_node.outputs['Alpha'], principled.inputs['Alpha'])
+                links.new(current_shader_output, output.inputs['Surface'])
+            else:
+                # Hard cutoff alphatest - use Mix Shader approach
+                print(f"[VLG DEBUG] Using hard cutoff alphatest (threshold: {props.alphatestreference})")
+                if hasattr(material, 'blend_method'):
+                    material.blend_method = 'BLEND'
+                if hasattr(material, 'shadow_method'):
+                    material.shadow_method = 'CLIP'
+                
+                # Create alpha test comparison node
+                alpha_test = nodes.new('ShaderNodeMath')
+                alpha_test.operation = 'GREATER_THAN'
+                alpha_test.location = (output.location[0] - 600, output.location[1] - 200)
+                alpha_test.inputs[1].default_value = props.alphatestreference
+                alpha_test.label = "Alpha Test"
+                
+                # Create Transparent BSDF
+                transparent = nodes.new('ShaderNodeBsdfTransparent')
+                transparent.location = (output.location[0] - 400, output.location[1] - 150)
+                transparent.label = "Transparent"
+                
+                # Create Mix Shader
+                mix_shader = nodes.new('ShaderNodeMixShader')
+                mix_shader.location = (output.location[0] - 200, output.location[1])
+                mix_shader.label = "Alpha Cutoff"
+                
+                # Connect: Alpha -> Greater Than -> Mix Factor
+                links.new(base_tex_node.outputs['Alpha'], alpha_test.inputs[0])
+                links.new(alpha_test.outputs['Value'], mix_shader.inputs['Fac'])
+                links.new(transparent.outputs['BSDF'], mix_shader.inputs[1])
+                links.new(current_shader_output, mix_shader.inputs[2])
+                links.new(mix_shader.outputs['Shader'], output.inputs['Surface'])
+        
+        elif props.translucent:
+            # For translucent materials
+            if hasattr(material, 'blend_method'):
+                material.blend_method = 'BLEND'
+            if hasattr(material, 'shadow_method'):
+                material.shadow_method = 'HASHED'
+            if hasattr(material, 'surface_render_method'):
+                material.surface_render_method = 'BLENDED'
+            
+            # Connect alpha with cleanup for halo artifacts
+            if props.basetexture and base_tex_node:
                 # Step 1: Create hard cutoff mask (alpha > 0.1 ? 1 : 0)
                 math_gt = nodes.new('ShaderNodeMath')
                 math_gt.location = (base_tex_node.location[0] + 250, base_tex_node.location[1] - 150)
@@ -1324,22 +1378,31 @@ def apply_vlg_material(material, props):
                 links.new(math_gt.outputs['Value'], math_mul.inputs[1])
                 links.new(math_mul.outputs['Value'], principled.inputs['Alpha'])
             else:
-                # For alphatest or direct alpha, connect directly
-                links.new(base_tex_node.outputs['Alpha'], principled.inputs['Alpha'])
-        else:
-            principled.inputs['Alpha'].default_value = props.alpha
+                principled.inputs['Alpha'].default_value = props.alpha
+            
+            links.new(current_shader_output, output.inputs['Surface'])
         
-        # Connect the shader output directly (alpha is handled by principled BSDF)
-        links.new(current_shader_output, output.inputs['Surface'])
+        else:
+            # Fallback
+            if hasattr(material, 'blend_method'):
+                material.blend_method = 'BLEND'
+            if props.basetexture and base_tex_node:
+                links.new(base_tex_node.outputs['Alpha'], principled.inputs['Alpha'])
+            links.new(current_shader_output, output.inputs['Surface'])
     else:
         if hasattr(material, 'blend_method'):
             material.blend_method = 'OPAQUE'
         links.new(current_shader_output, output.inputs['Surface'])
     
     # -------------------------------------------------------------------------
-    # BACKFACE CULLING
+    # BACKFACE CULLING AND TRANSPARENCY
     # -------------------------------------------------------------------------
     material.use_backface_culling = not props.nocull
+    
+    # For double-sided transparent materials, ensure backfaces render correctly
+    if props.nocull and (props.translucent or props.alphatest):
+        if hasattr(material, 'show_transparent_back'):
+            material.show_transparent_back = True
 
 
 # ============================================================================
@@ -1826,7 +1889,7 @@ def parse_vmt(content, props, base_path=""):
             parsed_values[key] = value
             print(f"  [PARSED] ${key} = \"[{value}]\"")
     
-    # Pattern for unquoted: $key "value"
+    # Pattern for unquoted key, quoted value: $key "value"
     pattern3 = r'(?<!")\$(\w+)\s+"([^"]*)"'
     for match in re.finditer(pattern3, content_no_comments, re.IGNORECASE):
         key = match.group(1).lower()
@@ -1834,6 +1897,25 @@ def parse_vmt(content, props, base_path=""):
         if key not in parsed_values:
             parsed_values[key] = value
             print(f"  [PARSED] ${key} = \"{value}\"")
+    
+    # Pattern for completely unquoted: $key value (number or simple word)
+    # This catches: $alphatest 1, $phong 1, $nocull 1, etc.
+    pattern4 = r'(?<!")\$(\w+)\s+([0-9.]+|true|false|yes|no)\b'
+    for match in re.finditer(pattern4, content_no_comments, re.IGNORECASE):
+        key = match.group(1).lower()
+        value = match.group(2)
+        if key not in parsed_values:
+            parsed_values[key] = value
+            print(f"  [PARSED] ${key} = {value} (unquoted)")
+    
+    # Pattern for unquoted key with bracketed vector: $key [1 2 3]
+    pattern5 = r'(?<!")\$(\w+)\s+\[([^\]]*)\]'
+    for match in re.finditer(pattern5, content_no_comments, re.IGNORECASE):
+        key = match.group(1).lower()
+        value = match.group(2)
+        if key not in parsed_values:
+            parsed_values[key] = value
+            print(f"  [PARSED] ${key} = [{value}] (unquoted)")
     
     print(f"\nTotal parsed: {len(parsed_values)} parameters")
     print("="*60 + "\n")
@@ -1932,6 +2014,8 @@ def parse_vmt(content, props, base_path=""):
             props.alphatest = value.lower() in ('1', 'true', 'yes')
         elif key == 'alphatestreference':
             props.alphatestreference = safe_float(value, 0.5)
+        elif key == 'allowalphatocoverage':
+            props.allowalphatocoverage = value.lower() in ('1', 'true', 'yes')
         elif key == 'additive':
             props.additive = value.lower() in ('1', 'true', 'yes')
         elif key == 'halflambert':

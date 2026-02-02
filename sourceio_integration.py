@@ -198,15 +198,9 @@ def import_materials_vlg(content_manager: ContentManager, mdl, base_path: str):
             # Store actual disk path if available, otherwise store relative path
             mat['vlg_vmt_path'] = vmt_disk_path if vmt_disk_path else str(vmt_path)
             
-            # Ensure blend settings are correct for translucent materials
-            # (apply_vlg_material should set these, but let's make sure)
+            # Ensure blend settings are correct for translucent/alphatest materials
+            # Note: apply_vlg_material handles the blend mode based on $allowalphatocoverage
             if props.translucent or props.alphatest:
-                if hasattr(mat, 'blend_method'):
-                    mat.blend_method = 'BLEND' if props.translucent else 'CLIP'
-                if hasattr(mat, 'shadow_method'):
-                    mat.shadow_method = 'CLIP' if props.alphatest else 'HASHED'
-                if hasattr(mat, 'surface_render_method'):
-                    mat.surface_render_method = 'BLENDED'
                 logger.info(f"[VLG] Set blend_method for {material.name} (translucent={props.translucent})")
             
             # Apply correct color space and alpha settings for each texture type
@@ -495,6 +489,8 @@ def parse_vmt_with_cm(vmt_content: str, props, content_manager: ContentManager, 
                 props.alphatestreference = float(value)
             except ValueError:
                 pass
+        elif key == 'allowalphatocoverage':
+            props.allowalphatocoverage = value.lower() in ('1', 'true', 'yes')
         
         # Handle color/vector properties
         elif key == 'envmaptint':
