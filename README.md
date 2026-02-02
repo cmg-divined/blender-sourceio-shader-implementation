@@ -1,7 +1,8 @@
 # Blender VertexLitGeneric Shader
 
 A Blender addon that replicates Source Engine's VertexLitGeneric shader for imported models. This allows Source 1 models (from Garry's Mod, Half-Life 2, Counter-Strike: Source, etc.) to render with accurate materials in Blender.
-Convert textures to tga with VTFEdit for faster load times please in the same directories.
+
+Convert textures to TGA with VTFEdit for faster load times please in the same directories.
 
 ## Features
 
@@ -84,4 +85,5 @@ In the Material Properties panel, click "Import VMT" to load material settings f
 ## License
 
 MIT License
+
 
