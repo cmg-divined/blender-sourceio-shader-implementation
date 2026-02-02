@@ -1,0 +1,108 @@
+/*
+ * Source Engine VertexLitGeneric OSL Shader for Blender Cycles
+ * With proper ambient lighting like Source Engine
+ */
+
+shader SourceVertexLitGeneric(
+    color BaseColor = color(1, 1, 1),
+    float BaseAlpha = 1.0,
+    normal Normal = N,
+    
+    int Phong = 1,
+    float PhongExponent = 10.0,
+    float PhongBoost = 1.0,
+    color PhongTint = color(1, 1, 1),
+    int PhongAlbedoTint = 0,
+    float PhongFresnelRangeLow = 0.0,
+    float PhongFresnelRangeMid = 0.5, 
+    float PhongFresnelRangeHigh = 1.0,
+    
+    int RimLight = 0,
+    float RimLightExponent = 4.0,
+    float RimLightBoost = 1.0,
+    int RimMask = 0,
+    
+    int HalfLambert = 1,
+    
+    color Color2 = color(1, 1, 1),
+    
+    int SelfIllum = 0,
+    color SelfIllumTint = color(1, 1, 1),
+    float SelfIllumStrength = 1.0,
+    
+    int Envmap = 0,
+    color EnvmapTint = color(1, 1, 1),
+    float EnvmapStrength = 1.0,
+    float EnvmapFresnel = 0.0,
+    
+    float SpecularMask = 1.0,
+    
+    // Ambient controls
+    float AmbientStrength = 0.3,
+    
+    output closure color BSDF = 0,
+    output color OutColor = color(0, 0, 0),
+    output float OutAlpha = 1.0)
+{
+    normal Nn = normalize(Normal);
+    vector V = normalize(-I);
+    color albedo = BaseColor * Color2;
+    float NdotV = max(dot(Nn, V), 0.0);
+    
+    // Source Engine Fresnel
+    float f = clamp(1.0 - NdotV, 0.0, 1.0);
+    f = f * f - 0.5;
+    float encLow = (PhongFresnelRangeMid - PhongFresnelRangeLow) * 2.0;
+    float encMid = PhongFresnelRangeMid;
+    float encHigh = (PhongFresnelRangeHigh - PhongFresnelRangeMid) * 2.0;
+    float fresnelTerm = 0.0;
+    if (f >= 0.0) {
+        fresnelTerm = clamp(encMid + encHigh * f, 0.0, 1.0);
+    } else {
+        fresnelTerm = clamp(encMid + encLow * f, 0.0, 1.0);
+    }
+    
+    // === AMBIENT (Source Engine always has ambient light) ===
+    // This ensures the model is never completely black
+    BSDF = AmbientStrength * albedo * emission();
+    
+    // === DIFFUSE ===
+    float sigma = 0.0;
+    if (HalfLambert == 1) {
+        sigma = 0.5;
+    }
+    BSDF = BSDF + albedo * diffuse(Nn);
+    
+    // === SPECULAR ===
+    if (Phong == 1) {
+        color specColor = PhongTint;
+        if (PhongAlbedoTint == 1) {
+            specColor = specColor * albedo;
+        }
+        float specWeight = fresnelTerm * PhongBoost * SpecularMask;
+        float toonSize = clamp(1.0 / (PhongExponent * 0.02 + 0.1), 0.01, 1.0);
+        BSDF = BSDF + specWeight * specColor * glossy_toon(Nn, toonSize, 0.3);
+    }
+    
+    // === RIM LIGHTING ===
+    if (RimLight == 1) {
+        float rimFactor = pow(clamp(1.0 - NdotV, 0.0, 1.0), RimLightExponent);
+        rimFactor = rimFactor * RimLightBoost;
+        BSDF = BSDF + rimFactor * albedo * diffuse(Nn);
+    }
+    
+    // === SELF-ILLUMINATION ===
+    if (SelfIllum == 1) {
+        BSDF = BSDF + SelfIllumStrength * SelfIllumTint * albedo * emission();
+    }
+    
+    // === ENVIRONMENT ===
+    if (Envmap == 1) {
+        float envFres = mix(1.0, fresnelTerm, EnvmapFresnel);
+        float envWeight = envFres * EnvmapStrength;
+        BSDF = BSDF + envWeight * EnvmapTint * glossy_toon(Nn, 0.05, 0.3);
+    }
+    
+    OutColor = albedo;
+    OutAlpha = BaseAlpha;
+}
