@@ -15,6 +15,7 @@ Convert textures to TGA with VTFEdit for faster load times please in the same di
   - Self-illumination
   - Normal mapping
 - Handles transparency ($translucent, $alphatest)
+- Can reload VMTs after making changes via the Reload VMT button under material settings to check changes out.
 - Automatic VTF texture conversion
 - SourceIO integration for MDL imports with VLG materials
 
@@ -85,5 +86,6 @@ In the Material Properties panel, click "Import VMT" to load material settings f
 ## License
 
 MIT License
+
 
 
