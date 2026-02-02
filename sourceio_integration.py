@@ -4,6 +4,40 @@
 import bpy
 from bpy.props import BoolProperty, CollectionProperty, StringProperty
 
+# Compatibility wrapper for SourceIO logger
+class LoggerWrapper:
+    """Wrapper to handle different SourceIO logger versions"""
+    def __init__(self, base_logger):
+        self._logger = base_logger
+    
+    def info(self, msg):
+        if hasattr(self._logger, 'info'):
+            self._logger.info(msg)
+        else:
+            print(f"[INFO] {msg}")
+    
+    def warning(self, msg):
+        # Some versions use 'warn' instead of 'warning'
+        if hasattr(self._logger, 'warning'):
+            self._logger.warning(msg)
+        elif hasattr(self._logger, 'warn'):
+            self._logger.warn(msg)
+        else:
+            print(f"[WARNING] {msg}")
+    
+    def error(self, msg):
+        if hasattr(self._logger, 'error'):
+            self._logger.error(msg)
+        else:
+            print(f"[ERROR] {msg}")
+    
+    def debug(self, msg):
+        if hasattr(self._logger, 'debug'):
+            self._logger.debug(msg)
+        else:
+            print(f"[DEBUG] {msg}")
+
+
 # Check if SourceIO is available
 SOURCEIO_AVAILABLE = False
 try:
@@ -26,9 +60,17 @@ try:
     from SourceIO.library.models.phy.phy import Phy
     from SourceIO.logger import SourceLogMan
     SOURCEIO_AVAILABLE = True
-    logger = SourceLogMan().get_logger("VLG::SourceIO")
+    _base_logger = SourceLogMan().get_logger("VLG::SourceIO")
+    logger = LoggerWrapper(_base_logger)
 except ImportError as e:
     print(f"[VLG] SourceIO not found - MDL import integration disabled: {e}")
+    # Create a fallback logger that just prints
+    class FallbackLogger:
+        def info(self, msg): print(f"[INFO] {msg}")
+        def warning(self, msg): print(f"[WARNING] {msg}")
+        def error(self, msg): print(f"[ERROR] {msg}")
+        def debug(self, msg): print(f"[DEBUG] {msg}")
+    logger = FallbackLogger()
 
 
 def import_materials_vlg(content_manager: ContentManager, mdl, base_path: str):
@@ -59,12 +101,54 @@ def import_materials_vlg(content_manager: ContentManager, mdl, base_path: str):
         material_file = None
         
         # Search through material paths to find the VMT
+        vmt_disk_path = None  # Will store actual disk path if available
         for mat_path in mdl.materials_paths:
             vmt_path = TinyPath("materials") / mat_path / (material.name + ".vmt")
             material_file = content_manager.find_file(vmt_path)
             if material_file:
                 material_path = TinyPath(mat_path) / material.name
-                logger.info(f"[VLG] Found VMT: {vmt_path}")
+                
+                # Try multiple ways to get the actual disk path
+                # Method 1: Direct path attribute
+                vmt_disk_path = getattr(material_file, 'path', None)
+                if vmt_disk_path:
+                    vmt_disk_path = str(vmt_disk_path)
+                
+                # Method 2: Try filepath attribute
+                if not vmt_disk_path:
+                    vmt_disk_path = getattr(material_file, 'filepath', None)
+                    if vmt_disk_path:
+                        vmt_disk_path = str(vmt_disk_path)
+                
+                # Method 3: Try to construct from content manager's mounted paths
+                if not vmt_disk_path:
+                    # Check if it's a loose file by looking at the content provider
+                    try:
+                        # The material_file might have info about where it came from
+                        if hasattr(material_file, '_path'):
+                            vmt_disk_path = str(material_file._path)
+                    except:
+                        pass
+                
+                # Method 4: Search common game paths for this VMT
+                if not vmt_disk_path:
+                    import os
+                    vmt_relative = str(vmt_path)
+                    # Try base_path first (where MDL was loaded from)
+                    if base_path:
+                        # Go up to find garrysmod folder
+                        test_base = base_path
+                        for _ in range(10):  # Max 10 levels up
+                            test_path = os.path.join(test_base, vmt_relative)
+                            if os.path.exists(test_path):
+                                vmt_disk_path = test_path
+                                break
+                            parent = os.path.dirname(test_base)
+                            if parent == test_base:
+                                break
+                            test_base = parent
+                
+                logger.info(f"[VLG] Found VMT: {vmt_path}" + (f" (disk: {vmt_disk_path})" if vmt_disk_path else " (in VPK or path unknown)"))
                 break
         
         if material_path is None:
@@ -111,6 +195,8 @@ def import_materials_vlg(content_manager: ContentManager, mdl, base_path: str):
         try:
             apply_vlg_material(mat, props)
             mat['vlg_loaded'] = True
+            # Store actual disk path if available, otherwise store relative path
+            mat['vlg_vmt_path'] = vmt_disk_path if vmt_disk_path else str(vmt_path)
             
             # Ensure blend settings are correct for translucent materials
             # (apply_vlg_material should set these, but let's make sure)

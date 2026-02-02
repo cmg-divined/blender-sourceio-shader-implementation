@@ -1422,12 +1422,16 @@ class VLG_OT_ImportVMT(Operator):
             print(f"\n[VLG] Created new material: {mat.name}")
             print(f"[VLG] Importing from: {self.filepath}")
             
+            # Store VMT path for refresh functionality
+            mat['vlg_vmt_path'] = self.filepath
+            
             # Parse VMT into material properties
             props = mat.vlg_props
             parse_vmt(content, props, os.path.dirname(self.filepath))
             
             # Apply the shader
             apply_vlg_material(mat, props)
+            mat['vlg_loaded'] = True
             
             # Assign to active object if there is one
             if context.active_object and hasattr(context.active_object, 'data') and hasattr(context.active_object.data, 'materials'):
@@ -1490,6 +1494,295 @@ class VLG_OT_ExportVMT(Operator):
     
     def invoke(self, context, event):
         self.filepath = context.active_object.active_material.name + ".vmt"
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
+class VLG_OT_RefreshMaterials(Operator):
+    """Rebuild VLG shader for all selected objects using current Blender properties"""
+    bl_idname = "vlg.refresh_materials"
+    bl_label = "Rebuild Shader"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    @classmethod
+    def poll(cls, context):
+        return context.selected_objects and len(context.selected_objects) > 0
+    
+    def execute(self, context):
+        refreshed_count = 0
+        skipped_count = 0
+        error_count = 0
+        
+        # Collect all unique materials from selected objects
+        materials_to_refresh = set()
+        for obj in context.selected_objects:
+            if hasattr(obj, 'data') and hasattr(obj.data, 'materials'):
+                for mat in obj.data.materials:
+                    if mat is not None:
+                        materials_to_refresh.add(mat)
+        
+        if not materials_to_refresh:
+            self.report({'WARNING'}, "No materials found on selected objects")
+            return {'CANCELLED'}
+        
+        for mat in materials_to_refresh:
+            # Check if this is a VLG material
+            if mat.get('vlg_loaded', False) or hasattr(mat, 'vlg_props'):
+                try:
+                    props = mat.vlg_props
+                    apply_vlg_material(mat, props)
+                    mat['vlg_loaded'] = True
+                    print(f"[VLG] Rebuilt shader: {mat.name}")
+                    refreshed_count += 1
+                except Exception as e:
+                    print(f"[VLG] Error rebuilding {mat.name}: {e}")
+                    error_count += 1
+            else:
+                skipped_count += 1
+        
+        msg = f"Rebuilt {refreshed_count} material(s)"
+        if skipped_count > 0:
+            msg += f", skipped {skipped_count} (not VLG)"
+        if error_count > 0:
+            msg += f", {error_count} error(s)"
+        
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
+class VLG_OT_ReloadVMT(Operator):
+    """Reload VMT files from disk for all selected objects"""
+    bl_idname = "vlg.reload_vmt"
+    bl_label = "Reload VMT"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    directory: StringProperty(subtype='DIR_PATH')
+    filter_glob: StringProperty(default="*.vmt", options={'HIDDEN'})
+    
+    @classmethod
+    def poll(cls, context):
+        return context.selected_objects and len(context.selected_objects) > 0
+    
+    def find_vmt_file(self, mat, base_directory):
+        """Try multiple strategies to find the VMT file for a material"""
+        stored_path = mat.get('vlg_vmt_path', '')
+        mat_name = mat.name.replace("VLG_", "")  # Remove VLG_ prefix if present
+        
+        # Strategy 1: Stored path exists directly on disk
+        if stored_path and os.path.exists(stored_path):
+            print(f"[VLG] Found via stored path: {stored_path}")
+            return stored_path
+        
+        # Strategy 2: Stored path is relative (like materials/models/...) - try with base directory
+        if stored_path and base_directory:
+            # Try combining base directory with stored relative path
+            # e.g., base="D:/SteamLibrary/.../garrysmod" + stored="materials/models/ouch/mat.vmt"
+            combined = os.path.join(base_directory, stored_path)
+            if os.path.exists(combined):
+                print(f"[VLG] Found via combined path: {combined}")
+                return combined
+            
+            # Also try with just the filename from stored path
+            stored_filename = os.path.basename(stored_path)
+            # Search recursively
+            for root, dirs, files in os.walk(base_directory):
+                if stored_filename in files:
+                    found_path = os.path.join(root, stored_filename)
+                    print(f"[VLG] Found via recursive search: {found_path}")
+                    return found_path
+        
+        # Strategy 3: Search by material name in base directory
+        if base_directory:
+            # Direct path
+            direct_path = os.path.join(base_directory, mat_name + ".vmt")
+            if os.path.exists(direct_path):
+                print(f"[VLG] Found via direct name: {direct_path}")
+                return direct_path
+            
+            # Recursive search by material name
+            for root, dirs, files in os.walk(base_directory):
+                vmt_name = mat_name + ".vmt"
+                if vmt_name in files:
+                    found_path = os.path.join(root, vmt_name)
+                    print(f"[VLG] Found via recursive name search: {found_path}")
+                    return found_path
+        
+        return None
+    
+    def execute(self, context):
+        reloaded_count = 0
+        not_found_count = 0
+        error_count = 0
+        
+        # Collect all unique materials from selected objects
+        materials_to_reload = set()
+        for obj in context.selected_objects:
+            if hasattr(obj, 'data') and hasattr(obj.data, 'materials'):
+                for mat in obj.data.materials:
+                    if mat is not None:
+                        materials_to_reload.add(mat)
+        
+        if not materials_to_reload:
+            self.report({'WARNING'}, "No materials found on selected objects")
+            return {'CANCELLED'}
+        
+        for mat in materials_to_reload:
+            # Try to find VMT file using multiple strategies
+            vmt_path = self.find_vmt_file(mat, self.directory)
+            
+            if vmt_path:
+                try:
+                    # Re-read the VMT file
+                    with open(vmt_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                    
+                    print(f"[VLG] Reloading VMT for {mat.name} from: {vmt_path}")
+                    
+                    # Get material properties
+                    props = mat.vlg_props
+                    
+                    # Clear texture paths so they get reloaded
+                    props.basetexture = ""
+                    props.bumpmap = ""
+                    props.phongexponenttexture = ""
+                    props.envmapmask = ""
+                    props.selfillummask = ""
+                    props.lightwarptexture = ""
+                    props.detail = ""
+                    
+                    # Re-parse VMT
+                    parse_vmt(content, props, os.path.dirname(vmt_path))
+                    
+                    # Update stored path to the actual disk path
+                    mat['vlg_vmt_path'] = vmt_path
+                    
+                    # Re-apply shader
+                    apply_vlg_material(mat, props)
+                    mat['vlg_loaded'] = True
+                    
+                    print(f"[VLG] Reloaded material: {mat.name}")
+                    reloaded_count += 1
+                    
+                except Exception as e:
+                    print(f"[VLG] Error reloading {mat.name}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    error_count += 1
+            else:
+                clean_name = mat.name.replace("VLG_", "")
+                stored = mat.get('vlg_vmt_path', 'none')
+                print(f"[VLG] VMT not found for: {mat.name}")
+                print(f"       Looking for: {clean_name}.vmt")
+                print(f"       Stored path: {stored}")
+                print(f"       Search dir: {self.directory}")
+                not_found_count += 1
+        
+        msg = f"Reloaded {reloaded_count} material(s)"
+        if not_found_count > 0:
+            msg += f", {not_found_count} VMT(s) not found - check console"
+        if error_count > 0:
+            msg += f", {error_count} error(s)"
+        
+        self.report({'INFO'} if reloaded_count > 0 else {'WARNING'}, msg)
+        return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        # Collect material info
+        mat_info = []  # List of (material, name, stored_path)
+        
+        for obj in context.selected_objects:
+            if hasattr(obj, 'data') and hasattr(obj.data, 'materials'):
+                for mat in obj.data.materials:
+                    if mat:
+                        stored_path = mat.get('vlg_vmt_path', '')
+                        mat_info.append((mat, mat.name, stored_path))
+        
+        if not mat_info:
+            self.report({'WARNING'}, "No materials found on selected objects")
+            return {'CANCELLED'}
+        
+        # Strategy 1: Check if any stored path exists directly
+        for mat, name, stored_path in mat_info:
+            if stored_path and os.path.exists(stored_path):
+                self.directory = os.path.dirname(stored_path)
+                print(f"[VLG] Found existing path: {stored_path}")
+                return self.execute(context)
+        
+        # Strategy 2: Try common Steam library locations with stored relative paths
+        common_bases = [
+            "D:/SteamLibrary/steamapps/common/GarrysMod/garrysmod",
+            "E:/SteamLibrary/steamapps/common/GarrysMod/garrysmod",
+            "F:/SteamLibrary/steamapps/common/GarrysMod/garrysmod",
+            "C:/Program Files (x86)/Steam/steamapps/common/GarrysMod/garrysmod",
+            "C:/Program Files/Steam/steamapps/common/GarrysMod/garrysmod",
+            "C:/Steam/steamapps/common/GarrysMod/garrysmod",
+        ]
+        
+        for mat, name, stored_path in mat_info:
+            if stored_path:
+                for base in common_bases:
+                    if os.path.exists(base):
+                        test_path = os.path.join(base, stored_path)
+                        if os.path.exists(test_path):
+                            # Found it! Update the stored path to the full path
+                            mat['vlg_vmt_path'] = test_path
+                            self.directory = os.path.dirname(test_path)
+                            print(f"[VLG] Auto-resolved path: {test_path}")
+                            return self.execute(context)
+        
+        # Strategy 3: Search for VMT files by name in common locations
+        for mat, name, stored_path in mat_info:
+            clean_name = name.replace("VLG_", "") + ".vmt"
+            for base in common_bases:
+                if os.path.exists(base):
+                    materials_dir = os.path.join(base, "materials")
+                    if os.path.exists(materials_dir):
+                        # Search recursively (limit depth to avoid long searches)
+                        for root, dirs, files in os.walk(materials_dir):
+                            # Limit search depth
+                            depth = root.replace(materials_dir, '').count(os.sep)
+                            if depth > 6:
+                                dirs[:] = []  # Don't go deeper
+                                continue
+                            if clean_name in files:
+                                found_path = os.path.join(root, clean_name)
+                                mat['vlg_vmt_path'] = found_path
+                                self.directory = root
+                                print(f"[VLG] Found via search: {found_path}")
+                                return self.execute(context)
+        
+        # Strategy 4: Check addons folder
+        for mat, name, stored_path in mat_info:
+            clean_name = name.replace("VLG_", "") + ".vmt"
+            for base in common_bases:
+                addons_dir = os.path.join(base, "addons")
+                if os.path.exists(addons_dir):
+                    for root, dirs, files in os.walk(addons_dir):
+                        depth = root.replace(addons_dir, '').count(os.sep)
+                        if depth > 6:
+                            dirs[:] = []
+                            continue
+                        if clean_name in files:
+                            found_path = os.path.join(root, clean_name)
+                            mat['vlg_vmt_path'] = found_path
+                            self.directory = root
+                            print(f"[VLG] Found in addons: {found_path}")
+                            return self.execute(context)
+        
+        # Nothing found - print debug info and show browser as last resort
+        print("\n" + "="*60)
+        print("[VLG] RELOAD VMT - Could not auto-find VMT files")
+        print("Looking for:")
+        for mat, name, stored_path in mat_info[:5]:
+            clean_name = name.replace("VLG_", "")
+            print(f"  - {clean_name}.vmt (stored: {stored_path or 'none'})")
+        print("\nSearched in:")
+        for base in common_bases:
+            status = "EXISTS" if os.path.exists(base) else "NOT FOUND"
+            print(f"  - {base} [{status}]")
+        print("="*60 + "\n")
+        
+        self.report({'WARNING'}, "Could not auto-find VMT files - please browse to folder")
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
@@ -1904,6 +2197,10 @@ class VLG_PT_MainPanel(Panel):
         row = layout.row(align=True)
         row.operator("vlg.import_vmt", icon='IMPORT')
         row.operator("vlg.export_vmt", icon='EXPORT')
+        
+        row = layout.row(align=True)
+        row.operator("vlg.refresh_materials", icon='SHADING_RENDERED')
+        row.operator("vlg.reload_vmt", icon='FILE_REFRESH')
 
 
 class VLG_PT_TexturesPanel(Panel):
@@ -2143,6 +2440,8 @@ classes = (
     VLG_OT_CreateMaterial,
     VLG_OT_ImportVMT,
     VLG_OT_ExportVMT,
+    VLG_OT_RefreshMaterials,
+    VLG_OT_ReloadVMT,
     VLG_PT_MainPanel,
     VLG_PT_TexturesPanel,
     VLG_PT_ColorPanel,
