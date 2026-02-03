@@ -795,6 +795,141 @@ def apply_vlg_material(material, props):
     # Disable metallic (Source phong isn't metallic)
     principled.inputs['Metallic'].default_value = 0.0
     
+    # -------------------------------------------------------------------------
+    # $phongfresnelranges - Modulate specular based on viewing angle
+    # -------------------------------------------------------------------------
+    # Implementation based on SourceIO's node group (reverse-engineered).
+    # Uses piecewise linear interpolation:
+    #   f = (1 - N·V)²
+    #   When f < 0.5: result = mix(min, mid, f * 2)
+    #   When f >= 0.5: result = mix(mid, max, f * 2 - 1)
+    # -------------------------------------------------------------------------
+    phong_fresnel_ranges = props.phongfresnelranges
+    use_fresnel_ranges = props.phong and (phong_fresnel_ranges[0] != 0.0 or 
+                                           phong_fresnel_ranges[1] != 0.5 or 
+                                           phong_fresnel_ranges[2] != 1.0)
+    
+    if use_fresnel_ranges:
+        print(f"[SHADER] Applying $phongfresnelranges: {phong_fresnel_ranges}")
+        fr_min, fr_mid, fr_max = phong_fresnel_ranges
+        
+        # Get base specular value that was set earlier
+        base_spec = principled.inputs['Specular IOR Level'].default_value
+        
+        # Geometry node for N·V calculation
+        fr_geometry = nodes.new('ShaderNodeNewGeometry')
+        fr_geometry.location = (200, 400)
+        fr_geometry.label = "Fresnel Geometry"
+        
+        # Vector Math: DOT_PRODUCT(Normal, Incoming) = N·V
+        fr_dot = nodes.new('ShaderNodeVectorMath')
+        fr_dot.operation = 'DOT_PRODUCT'
+        fr_dot.location = (400, 400)
+        fr_dot.label = "N·V"
+        links.new(fr_geometry.outputs['Normal'], fr_dot.inputs[0])
+        links.new(fr_geometry.outputs['Incoming'], fr_dot.inputs[1])
+        
+        # Math.005: f = 1 - N·V
+        fr_one_minus = nodes.new('ShaderNodeMath')
+        fr_one_minus.operation = 'SUBTRACT'
+        fr_one_minus.location = (550, 400)
+        fr_one_minus.inputs[0].default_value = 1.0
+        fr_one_minus.label = "1 - N·V"
+        links.new(fr_dot.outputs['Value'], fr_one_minus.inputs[1])
+        
+        # Math.022: f² = f * f
+        fr_square = nodes.new('ShaderNodeMath')
+        fr_square.operation = 'MULTIPLY'
+        fr_square.location = (700, 400)
+        fr_square.label = "f²"
+        links.new(fr_one_minus.outputs['Value'], fr_square.inputs[0])
+        links.new(fr_one_minus.outputs['Value'], fr_square.inputs[1])
+        
+        # Math.023: factor_low = f² * 2 (remaps 0-0.5 to 0-1)
+        fr_factor_low = nodes.new('ShaderNodeMath')
+        fr_factor_low.operation = 'MULTIPLY'
+        fr_factor_low.location = (850, 450)
+        fr_factor_low.inputs[1].default_value = 2.0
+        fr_factor_low.label = "f² × 2"
+        links.new(fr_square.outputs['Value'], fr_factor_low.inputs[0])
+        
+        # Math.024: factor_high = f² * 2 - 1 (remaps 0.5-1 to 0-1)
+        fr_factor_high = nodes.new('ShaderNodeMath')
+        fr_factor_high.operation = 'ADD'
+        fr_factor_high.location = (1000, 450)
+        fr_factor_high.inputs[1].default_value = -1.0
+        fr_factor_high.label = "f²×2 - 1"
+        links.new(fr_factor_low.outputs['Value'], fr_factor_high.inputs[0])
+        
+        # Math.026: step = f² > 0.5 (1 when in high range, 0 when in low range)
+        fr_step = nodes.new('ShaderNodeMath')
+        fr_step.operation = 'GREATER_THAN'
+        fr_step.location = (850, 300)
+        fr_step.inputs[1].default_value = 0.5
+        fr_step.label = "f² > 0.5"
+        links.new(fr_square.outputs['Value'], fr_step.inputs[0])
+        
+        # Math.025: inv_step = 1 - step
+        fr_inv_step = nodes.new('ShaderNodeMath')
+        fr_inv_step.operation = 'SUBTRACT'
+        fr_inv_step.location = (1000, 300)
+        fr_inv_step.inputs[0].default_value = 1.0
+        fr_inv_step.label = "1 - step"
+        links.new(fr_step.outputs['Value'], fr_inv_step.inputs[1])
+        
+        # Mix.005: low_range = mix(min, mid, factor_low)
+        fr_mix_low = nodes.new('ShaderNodeMix')
+        fr_mix_low.data_type = 'FLOAT'
+        fr_mix_low.location = (1150, 500)
+        fr_mix_low.label = "Mix min→mid"
+        fr_mix_low.inputs['A'].default_value = fr_min
+        fr_mix_low.inputs['B'].default_value = fr_mid
+        links.new(fr_factor_low.outputs['Value'], fr_mix_low.inputs['Factor'])
+        
+        # Mix.002: high_range = mix(mid, max, factor_high)
+        fr_mix_high = nodes.new('ShaderNodeMix')
+        fr_mix_high.data_type = 'FLOAT'
+        fr_mix_high.location = (1150, 350)
+        fr_mix_high.label = "Mix mid→max"
+        fr_mix_high.inputs['A'].default_value = fr_mid
+        fr_mix_high.inputs['B'].default_value = fr_max
+        links.new(fr_factor_high.outputs['Value'], fr_mix_high.inputs['Factor'])
+        
+        # Math.027: low_contribution = low_range * inv_step
+        fr_low_contrib = nodes.new('ShaderNodeMath')
+        fr_low_contrib.operation = 'MULTIPLY'
+        fr_low_contrib.location = (1300, 500)
+        fr_low_contrib.label = "Low × mask"
+        links.new(fr_mix_low.outputs['Result'], fr_low_contrib.inputs[0])
+        links.new(fr_inv_step.outputs['Value'], fr_low_contrib.inputs[1])
+        
+        # Math.029: high_contribution = high_range * step
+        fr_high_contrib = nodes.new('ShaderNodeMath')
+        fr_high_contrib.operation = 'MULTIPLY'
+        fr_high_contrib.location = (1300, 350)
+        fr_high_contrib.label = "High × mask"
+        links.new(fr_mix_high.outputs['Result'], fr_high_contrib.inputs[0])
+        links.new(fr_step.outputs['Value'], fr_high_contrib.inputs[1])
+        
+        # Math.028: fresnel_result = low_contribution + high_contribution
+        fr_result = nodes.new('ShaderNodeMath')
+        fr_result.operation = 'ADD'
+        fr_result.location = (1450, 420)
+        fr_result.label = "Fresnel Ranges"
+        links.new(fr_low_contrib.outputs['Value'], fr_result.inputs[0])
+        links.new(fr_high_contrib.outputs['Value'], fr_result.inputs[1])
+        
+        # Multiply base specular by fresnel ranges result
+        fr_spec_mult = nodes.new('ShaderNodeMath')
+        fr_spec_mult.operation = 'MULTIPLY'
+        fr_spec_mult.location = (1600, 420)
+        fr_spec_mult.inputs[0].default_value = base_spec
+        fr_spec_mult.label = "Spec × Fresnel"
+        links.new(fr_result.outputs['Value'], fr_spec_mult.inputs[1])
+        
+        # Connect to Specular IOR Level
+        links.new(fr_spec_mult.outputs['Value'], principled.inputs['Specular IOR Level'])
+    
     # We'll use emission for self-illum effects
     emission = nodes.new('ShaderNodeEmission')
     emission.location = (600, -300)
