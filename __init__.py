@@ -1092,25 +1092,21 @@ def apply_vlg_material(material, props):
             tex_y -= 300
     
     # -------------------------------------------------------------------------
-    # LIGHTWARP TEXTURE
+    # LIGHTWARP TEXTURE (SourceIO-accurate implementation)
     # $lightwarptexture - 1D texture that remaps diffuse lighting
     # 
-    # In Source Engine:
-    # - Dark areas (shadows) sample from LEFT side of warp texture
-    # - Bright areas (lit) sample from RIGHT side of warp texture
-    # - A "soft" warp has brighter left side → softer shadows
-    # - The warp TINTS the lighting result, like localized color correction
-    #
-    # Since Blender's Principled BSDF handles lighting internally, we can't
-    # directly intercept the diffuse calculation. Instead, we approximate by
-    # sampling the warp based on a facing factor and using it for subtle
-    # shadow fill via emission.
+    # SourceIO approach:
+    # 1. Create Diffuse BSDF with normal map
+    # 2. Shader to RGB captures actual lighting intensity
+    # 3. Map Range converts lighting (0-1) to UV (0-0.995)
+    # 4. Sample lightwarp texture using lighting as X coordinate
+    # 5. Overlay blend with shading result
     # -------------------------------------------------------------------------
-    lightwarp_emission_node = None
+    lightwarp_color_node = None
     if props.lightwarptexture:
         img = load_texture(props.lightwarptexture, 'sRGB')
         if img:
-            print(f"[SHADER] Applying lightwarp texture: {props.lightwarptexture}")
+            print(f"[SHADER] Applying lightwarp texture (SourceIO method): {props.lightwarptexture}")
             
             # Create lightwarp texture node
             warp_tex = nodes.new('ShaderNodeTexImage')
@@ -1118,86 +1114,52 @@ def apply_vlg_material(material, props):
             warp_tex.image = img
             warp_tex.label = "Light Warp"
             warp_tex.interpolation = 'Linear'
-            warp_tex.extension = 'EXTEND'  # Clamp to edge (important per docs)
+            warp_tex.extension = 'EXTEND'  # Clamp to edge
             
-            # Geometry node to get facing factor (proxy for diffuse lighting)
-            geometry = nodes.new('ShaderNodeNewGeometry')
-            geometry.location = (tex_x - 400, tex_y)
+            # Create a Diffuse BSDF to capture actual lighting (like SourceIO)
+            lw_diffuse = nodes.new('ShaderNodeBsdfDiffuse')
+            lw_diffuse.location = (tex_x - 400, tex_y - 100)
+            lw_diffuse.inputs['Color'].default_value = (1.0, 1.0, 1.0, 1.0)
+            lw_diffuse.inputs['Roughness'].default_value = 0.0
+            lw_diffuse.label = "LW Diffuse"
             
-            # Calculate facing factor: N · -Incoming (0=grazing/shadow, 1=facing/lit)
-            dot_product = nodes.new('ShaderNodeVectorMath')
-            dot_product.operation = 'DOT_PRODUCT'
-            dot_product.location = (tex_x - 200, tex_y)
+            # Connect normal map if we have one
+            if normal_map_node:
+                links.new(normal_map_node.outputs['Normal'], lw_diffuse.inputs['Normal'])
             
-            negate = nodes.new('ShaderNodeVectorMath')
-            negate.operation = 'SCALE'
-            negate.location = (tex_x - 300, tex_y - 80)
-            negate.inputs['Scale'].default_value = -1.0
+            # Shader to RGB - captures actual lighting from scene
+            lw_shader_to_rgb = nodes.new('ShaderNodeShaderToRGB')
+            lw_shader_to_rgb.location = (tex_x - 200, tex_y - 100)
+            lw_shader_to_rgb.label = "Lighting Capture"
+            links.new(lw_diffuse.outputs['BSDF'], lw_shader_to_rgb.inputs['Shader'])
             
-            links.new(geometry.outputs['Incoming'], negate.inputs[0])
-            links.new(geometry.outputs['Normal'], dot_product.inputs[0])
-            links.new(negate.outputs['Vector'], dot_product.inputs[1])
+            # Map Range: lighting (0-1) → UV (0-0.995)
+            # The 0.995 prevents sampling exactly at the edge
+            lw_map_range = nodes.new('ShaderNodeMapRange')
+            lw_map_range.location = (tex_x, tex_y - 100)
+            lw_map_range.clamp = True
+            lw_map_range.inputs['From Min'].default_value = 0.0
+            lw_map_range.inputs['From Max'].default_value = 1.0
+            lw_map_range.inputs['To Min'].default_value = 0.0
+            lw_map_range.inputs['To Max'].default_value = 0.995
+            lw_map_range.label = "Light→UV"
+            links.new(lw_shader_to_rgb.outputs['Color'], lw_map_range.inputs['Value'])
             
-            # Clamp to 0-1
-            clamp_facing = nodes.new('ShaderNodeClamp')
-            clamp_facing.location = (tex_x - 50, tex_y)
-            clamp_facing.inputs['Min'].default_value = 0.0
-            clamp_facing.inputs['Max'].default_value = 1.0
-            links.new(dot_product.outputs['Value'], clamp_facing.inputs['Value'])
+            # Combine XYZ: X = lighting UV, Y = 0.5 (center of 1D texture)
+            lw_combine_uv = nodes.new('ShaderNodeCombineXYZ')
+            lw_combine_uv.location = (tex_x + 200, tex_y - 100)
+            lw_combine_uv.inputs['Y'].default_value = 0.5
+            lw_combine_uv.inputs['Z'].default_value = 0.0
+            lw_combine_uv.label = "Warp UV"
+            links.new(lw_map_range.outputs['Result'], lw_combine_uv.inputs['X'])
             
-            # UV for warp sampling: X = facing (0=shadow, 1=lit), Y = 0.5
-            combine_uv = nodes.new('ShaderNodeCombineXYZ')
-            combine_uv.location = (tex_x + 100, tex_y)
-            combine_uv.inputs['Y'].default_value = 0.5
-            combine_uv.inputs['Z'].default_value = 0.0
-            combine_uv.label = "Warp UV"
+            # Connect UV to warp texture
+            links.new(lw_combine_uv.outputs['Vector'], warp_tex.inputs['Vector'])
             
-            links.new(clamp_facing.outputs['Result'], combine_uv.inputs['X'])
-            links.new(combine_uv.outputs['Vector'], warp_tex.inputs['Vector'])
+            # Store for later use in overlay blending
+            lightwarp_color_node = warp_tex
             
-            # The warp texture determines shadow tinting:
-            # - Left side (sampled in shadows) determines shadow color/brightness
-            # - For "soft" warps, left side is brighter than black → softer shadows
-            #
-            # We use this as subtle fill light: the warp color tints shadow areas
-            # Shadow amount = 1 - facing (more shadow at grazing angles)
-            
-            inverse_facing = nodes.new('ShaderNodeMath')
-            inverse_facing.operation = 'SUBTRACT'
-            inverse_facing.location = (tex_x + 100, tex_y - 100)
-            inverse_facing.inputs[0].default_value = 1.0
-            inverse_facing.label = "Shadow Amount"
-            links.new(clamp_facing.outputs['Result'], inverse_facing.inputs[1])
-            
-            # Scale shadow amount by warp texture brightness (from left side of warp)
-            # A brighter warp left side = more fill light = softer shadows
-            warp_brightness = nodes.new('ShaderNodeSeparateColor')
-            warp_brightness.location = (tex_x + 300, tex_y - 50)
-            links.new(warp_tex.outputs['Color'], warp_brightness.inputs['Color'])
-            
-            # Emission strength: shadow_amount * warp_brightness * scale
-            # Scale is subtle (0.2) to avoid over-brightening
-            shadow_fill = nodes.new('ShaderNodeMath')
-            shadow_fill.operation = 'MULTIPLY'
-            shadow_fill.location = (tex_x + 300, tex_y - 150)
-            links.new(inverse_facing.outputs['Value'], shadow_fill.inputs[0])
-            links.new(warp_brightness.outputs['Red'], shadow_fill.inputs[1])
-            
-            final_strength = nodes.new('ShaderNodeMath')
-            final_strength.operation = 'MULTIPLY'
-            final_strength.location = (tex_x + 450, tex_y - 150)
-            final_strength.inputs[1].default_value = 0.25  # Subtle fill
-            final_strength.label = "Fill Strength"
-            links.new(shadow_fill.outputs['Value'], final_strength.inputs[0])
-            
-            # Emission color: base texture color (tinted by warp if desired)
-            if base_tex_node:
-                lightwarp_emission_node = (base_tex_node, final_strength)
-            else:
-                # Use warp color directly for flat color materials
-                lightwarp_emission_node = (warp_tex, final_strength)
-            
-            print(f"[SHADER] Lightwarp fill light configured (softens shadows)")
+            print(f"[SHADER] Lightwarp configured - samples based on actual scene lighting")
             tex_y -= 350
     
     # -------------------------------------------------------------------------
@@ -1506,34 +1468,45 @@ def apply_vlg_material(material, props):
         emission_output = emission.outputs[0]
     
     # -------------------------------------------------------------------------
-    # LIGHTWARP FILL LIGHT (adds to emission for softer shadows)
+    # LIGHTWARP OVERLAY (SourceIO-style: overlay blend with shading)
     # -------------------------------------------------------------------------
-    if lightwarp_emission_node:
-        color_node, strength_node = lightwarp_emission_node
+    # Note: In SourceIO, lightwarp is applied as an overlay blend on the final
+    # shading result. Since we use Principled BSDF which handles lighting
+    # internally, we apply the lightwarp as a color modifier on the base color.
+    # This tints the diffuse based on lighting intensity.
+    # -------------------------------------------------------------------------
+    if lightwarp_color_node and base_tex_node:
+        # Create overlay blend: base_color OVERLAY lightwarp_color
+        # This tints the base texture based on the lightwarp lookup
+        lw_overlay = nodes.new('ShaderNodeMix')
+        lw_overlay.data_type = 'RGBA'
+        lw_overlay.blend_type = 'OVERLAY'
+        lw_overlay.location = (400, 200)
+        lw_overlay.inputs['Factor'].default_value = 1.0
+        lw_overlay.label = "Lightwarp Overlay"
         
-        # Create emission shader for lightwarp fill light
-        lightwarp_emission = nodes.new('ShaderNodeEmission')
-        lightwarp_emission.location = (750, -500)
-        lightwarp_emission.label = "Lightwarp Fill"
-        
-        # Connect color (from base texture or warp texture)
-        if hasattr(color_node, 'outputs'):
-            if 'Color' in color_node.outputs:
-                links.new(color_node.outputs['Color'], lightwarp_emission.inputs['Color'])
-            else:
-                links.new(color_node.outputs[0], lightwarp_emission.inputs['Color'])
-        
-        links.new(strength_node.outputs['Value'], lightwarp_emission.inputs['Strength'])
-        
-        # Add lightwarp fill to existing emission
-        add_lightwarp = nodes.new('ShaderNodeAddShader')
-        add_lightwarp.location = (900, -400)
-        add_lightwarp.label = "Add Lightwarp"
-        links.new(emission_output, add_lightwarp.inputs[0])
-        links.new(lightwarp_emission.outputs['Emission'], add_lightwarp.inputs[1])
-        
-        emission_output = add_lightwarp.outputs[0]
-        print(f"[SHADER] Lightwarp fill light connected")
+        # Find current base color connection and intercept it
+        # The base color should be connected to Principled BSDF
+        base_color_links = [l for l in links if l.to_socket == principled.inputs['Base Color']]
+        if base_color_links:
+            # Get the current source of base color
+            base_color_source = base_color_links[0].from_socket
+            
+            # Remove old connection
+            links.remove(base_color_links[0])
+            
+            # Connect: base_color → overlay.A, lightwarp → overlay.B
+            links.new(base_color_source, lw_overlay.inputs['A'])
+            links.new(lightwarp_color_node.outputs['Color'], lw_overlay.inputs['B'])
+            
+            # Connect overlay result to Principled BSDF
+            links.new(lw_overlay.outputs['Result'], principled.inputs['Base Color'])
+            
+            print(f"[SHADER] Lightwarp overlay applied to base color")
+        else:
+            # No base texture connection, apply directly
+            links.new(lightwarp_color_node.outputs['Color'], principled.inputs['Base Color'])
+            print(f"[SHADER] Lightwarp applied as base color (no base texture)")
     
     # -------------------------------------------------------------------------
     # COMBINE SHADERS (Diffuse + Envmap + Emission)
