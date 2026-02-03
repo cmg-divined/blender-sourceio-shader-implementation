@@ -1379,35 +1379,99 @@ def apply_vlg_material(material, props):
         emission.inputs['Strength'].default_value = 0.0
     
     # -------------------------------------------------------------------------
-    # RIM LIGHTING
+    # RIM LIGHTING (SourceIO-accurate implementation)
+    # -------------------------------------------------------------------------
+    # Formula: rim = max(saturate(1 - N·V)^exponent × Normal.z, 0) × boost
+    # The Normal.z term is Source's ambient cube rim mask (up-facing surfaces)
     # -------------------------------------------------------------------------
     if props.rimlight:
-        # Create rim lighting using fresnel
-        rim_fresnel = nodes.new('ShaderNodeFresnel')
-        rim_fresnel.location = (200, -400)
-        rim_fresnel.inputs['IOR'].default_value = 1.5
+        print(f"[SHADER] Rim light: exponent={props.rimlightexponent}, boost={props.rimlightboost}")
         
+        # Geometry node for N·V and Normal.z
+        rim_geometry = nodes.new('ShaderNodeNewGeometry')
+        rim_geometry.location = (100, -400)
+        rim_geometry.label = "Rim Geometry"
+        
+        # Vector Math: N·V = dot(Normal, Incoming)
+        rim_ndotv = nodes.new('ShaderNodeVectorMath')
+        rim_ndotv.operation = 'DOT_PRODUCT'
+        rim_ndotv.location = (250, -350)
+        rim_ndotv.label = "N·V"
+        links.new(rim_geometry.outputs['Normal'], rim_ndotv.inputs[0])
+        links.new(rim_geometry.outputs['Incoming'], rim_ndotv.inputs[1])
+        
+        # fresnel = saturate(1 - N·V)
+        rim_one_minus = nodes.new('ShaderNodeMath')
+        rim_one_minus.operation = 'SUBTRACT'
+        rim_one_minus.use_clamp = True  # saturate
+        rim_one_minus.location = (400, -350)
+        rim_one_minus.inputs[0].default_value = 1.0
+        rim_one_minus.label = "1 - N·V (clamped)"
+        links.new(rim_ndotv.outputs['Value'], rim_one_minus.inputs[1])
+        
+        # fresnel^exponent
         rim_power = nodes.new('ShaderNodeMath')
         rim_power.operation = 'POWER'
-        rim_power.location = (350, -400)
+        rim_power.location = (550, -350)
         rim_power.inputs[1].default_value = props.rimlightexponent
+        rim_power.label = "Fresnel^Exp"
+        links.new(rim_one_minus.outputs['Value'], rim_power.inputs[0])
         
-        rim_mult = nodes.new('ShaderNodeMath')
-        rim_mult.operation = 'MULTIPLY'
-        rim_mult.location = (500, -400)
-        rim_mult.inputs[1].default_value = props.rimlightboost
+        # Normal.z = dot(Normal, [0, 0, 1]) - up-facing mask
+        rim_normal_z = nodes.new('ShaderNodeVectorMath')
+        rim_normal_z.operation = 'DOT_PRODUCT'
+        rim_normal_z.location = (250, -500)
+        rim_normal_z.inputs[1].default_value = (0.0, 0.0, 1.0)
+        rim_normal_z.label = "Normal.z (up mask)"
+        links.new(rim_geometry.outputs['Normal'], rim_normal_z.inputs[0])
         
+        # fresnel^exp × Normal.z
+        rim_mult_z = nodes.new('ShaderNodeMath')
+        rim_mult_z.operation = 'MULTIPLY'
+        rim_mult_z.location = (700, -400)
+        rim_mult_z.label = "Fresnel × Normal.z"
+        links.new(rim_power.outputs['Value'], rim_mult_z.inputs[0])
+        links.new(rim_normal_z.outputs['Value'], rim_mult_z.inputs[1])
+        
+        # max(result, 0)
+        rim_max = nodes.new('ShaderNodeMath')
+        rim_max.operation = 'MAXIMUM'
+        rim_max.location = (850, -400)
+        rim_max.inputs[1].default_value = 0.0
+        rim_max.label = "max(rim, 0)"
+        links.new(rim_mult_z.outputs['Value'], rim_max.inputs[0])
+        
+        # × rimlightboost
+        rim_boost = nodes.new('ShaderNodeMath')
+        rim_boost.operation = 'MULTIPLY'
+        rim_boost.location = (1000, -400)
+        rim_boost.inputs[1].default_value = props.rimlightboost
+        rim_boost.label = "× Boost"
+        links.new(rim_max.outputs['Value'], rim_boost.inputs[0])
+        
+        # Rim mask from phong exponent texture alpha (if enabled)
+        if props.rimmask and props.phongexponenttexture:
+            rim_mask_mult = nodes.new('ShaderNodeMath')
+            rim_mask_mult.operation = 'MULTIPLY'
+            rim_mask_mult.location = (1150, -400)
+            rim_mask_mult.label = "× Rim Mask"
+            links.new(rim_boost.outputs['Value'], rim_mask_mult.inputs[0])
+            # The rim mask connection will be made when loading the phongexponenttexture
+            rim_final = rim_mask_mult
+        else:
+            rim_final = rim_boost
+        
+        # Create rim emission
         rim_emission = nodes.new('ShaderNodeEmission')
-        rim_emission.location = (600, -450)
+        rim_emission.location = (1300, -450)
         rim_emission.inputs['Color'].default_value = (*props.phongtint, 1)
-        
-        links.new(rim_fresnel.outputs[0], rim_power.inputs[0])
-        links.new(rim_power.outputs[0], rim_mult.inputs[0])
-        links.new(rim_mult.outputs[0], rim_emission.inputs['Strength'])
+        rim_emission.label = "Rim Emission"
+        links.new(rim_final.outputs['Value'], rim_emission.inputs['Strength'])
         
         # Add rim to emission
         add_rim = nodes.new('ShaderNodeAddShader')
-        add_rim.location = (750, -300)
+        add_rim.location = (1450, -300)
+        add_rim.label = "Add Rim"
         links.new(emission.outputs[0], add_rim.inputs[0])
         links.new(rim_emission.outputs[0], add_rim.inputs[1])
         
