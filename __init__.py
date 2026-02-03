@@ -444,6 +444,12 @@ class VLGMaterialProperties(PropertyGroup):
         default=False
     )
     
+    fix_wetness: BoolProperty(
+        name="Fix Wetness",
+        description="Reduces phong exponent scaling to prevent overly shiny/wet appearance",
+        default=False
+    )
+    
     model: BoolProperty(
         name="Model",
         description="$model - Material is for a model (affects lighting)",
@@ -926,6 +932,115 @@ def apply_vlg_material(material, props):
             tex_y -= 300
     
     # -------------------------------------------------------------------------
+    # LIGHTWARP TEXTURE
+    # $lightwarptexture - 1D texture that remaps diffuse lighting
+    # 
+    # In Source Engine:
+    # - Dark areas (shadows) sample from LEFT side of warp texture
+    # - Bright areas (lit) sample from RIGHT side of warp texture
+    # - A "soft" warp has brighter left side → softer shadows
+    # - The warp TINTS the lighting result, like localized color correction
+    #
+    # Since Blender's Principled BSDF handles lighting internally, we can't
+    # directly intercept the diffuse calculation. Instead, we approximate by
+    # sampling the warp based on a facing factor and using it for subtle
+    # shadow fill via emission.
+    # -------------------------------------------------------------------------
+    lightwarp_emission_node = None
+    if props.lightwarptexture:
+        img = load_texture(props.lightwarptexture, 'sRGB')
+        if img:
+            print(f"[SHADER] Applying lightwarp texture: {props.lightwarptexture}")
+            
+            # Create lightwarp texture node
+            warp_tex = nodes.new('ShaderNodeTexImage')
+            warp_tex.location = (tex_x, tex_y)
+            warp_tex.image = img
+            warp_tex.label = "Light Warp"
+            warp_tex.interpolation = 'Linear'
+            warp_tex.extension = 'EXTEND'  # Clamp to edge (important per docs)
+            
+            # Geometry node to get facing factor (proxy for diffuse lighting)
+            geometry = nodes.new('ShaderNodeNewGeometry')
+            geometry.location = (tex_x - 400, tex_y)
+            
+            # Calculate facing factor: N · -Incoming (0=grazing/shadow, 1=facing/lit)
+            dot_product = nodes.new('ShaderNodeVectorMath')
+            dot_product.operation = 'DOT_PRODUCT'
+            dot_product.location = (tex_x - 200, tex_y)
+            
+            negate = nodes.new('ShaderNodeVectorMath')
+            negate.operation = 'SCALE'
+            negate.location = (tex_x - 300, tex_y - 80)
+            negate.inputs['Scale'].default_value = -1.0
+            
+            links.new(geometry.outputs['Incoming'], negate.inputs[0])
+            links.new(geometry.outputs['Normal'], dot_product.inputs[0])
+            links.new(negate.outputs['Vector'], dot_product.inputs[1])
+            
+            # Clamp to 0-1
+            clamp_facing = nodes.new('ShaderNodeClamp')
+            clamp_facing.location = (tex_x - 50, tex_y)
+            clamp_facing.inputs['Min'].default_value = 0.0
+            clamp_facing.inputs['Max'].default_value = 1.0
+            links.new(dot_product.outputs['Value'], clamp_facing.inputs['Value'])
+            
+            # UV for warp sampling: X = facing (0=shadow, 1=lit), Y = 0.5
+            combine_uv = nodes.new('ShaderNodeCombineXYZ')
+            combine_uv.location = (tex_x + 100, tex_y)
+            combine_uv.inputs['Y'].default_value = 0.5
+            combine_uv.inputs['Z'].default_value = 0.0
+            combine_uv.label = "Warp UV"
+            
+            links.new(clamp_facing.outputs['Result'], combine_uv.inputs['X'])
+            links.new(combine_uv.outputs['Vector'], warp_tex.inputs['Vector'])
+            
+            # The warp texture determines shadow tinting:
+            # - Left side (sampled in shadows) determines shadow color/brightness
+            # - For "soft" warps, left side is brighter than black → softer shadows
+            #
+            # We use this as subtle fill light: the warp color tints shadow areas
+            # Shadow amount = 1 - facing (more shadow at grazing angles)
+            
+            inverse_facing = nodes.new('ShaderNodeMath')
+            inverse_facing.operation = 'SUBTRACT'
+            inverse_facing.location = (tex_x + 100, tex_y - 100)
+            inverse_facing.inputs[0].default_value = 1.0
+            inverse_facing.label = "Shadow Amount"
+            links.new(clamp_facing.outputs['Result'], inverse_facing.inputs[1])
+            
+            # Scale shadow amount by warp texture brightness (from left side of warp)
+            # A brighter warp left side = more fill light = softer shadows
+            warp_brightness = nodes.new('ShaderNodeSeparateColor')
+            warp_brightness.location = (tex_x + 300, tex_y - 50)
+            links.new(warp_tex.outputs['Color'], warp_brightness.inputs['Color'])
+            
+            # Emission strength: shadow_amount * warp_brightness * scale
+            # Scale is subtle (0.2) to avoid over-brightening
+            shadow_fill = nodes.new('ShaderNodeMath')
+            shadow_fill.operation = 'MULTIPLY'
+            shadow_fill.location = (tex_x + 300, tex_y - 150)
+            links.new(inverse_facing.outputs['Value'], shadow_fill.inputs[0])
+            links.new(warp_brightness.outputs['Red'], shadow_fill.inputs[1])
+            
+            final_strength = nodes.new('ShaderNodeMath')
+            final_strength.operation = 'MULTIPLY'
+            final_strength.location = (tex_x + 450, tex_y - 150)
+            final_strength.inputs[1].default_value = 0.25  # Subtle fill
+            final_strength.label = "Fill Strength"
+            links.new(shadow_fill.outputs['Value'], final_strength.inputs[0])
+            
+            # Emission color: base texture color (tinted by warp if desired)
+            if base_tex_node:
+                lightwarp_emission_node = (base_tex_node, final_strength)
+            else:
+                # Use warp color directly for flat color materials
+                lightwarp_emission_node = (warp_tex, final_strength)
+            
+            print(f"[SHADER] Lightwarp fill light configured (softens shadows)")
+            tex_y -= 350
+    
+    # -------------------------------------------------------------------------
     # PHONG EXPONENT TEXTURE
     # Controls roughness per-pixel (R channel = exponent, higher = shinier)
     # -------------------------------------------------------------------------
@@ -945,11 +1060,14 @@ def apply_vlg_material(material, props):
             sep_rgb.location = (tex_x + 200, tex_y)
             links.new(phong_tex.outputs['Color'], sep_rgb.inputs['Color'])
             
-            # Scale to exponent range (1-150)
+            # Scale to exponent range
+            # Normal: 149 (maps 0-1 to 1-150 exponent range)
+            # Fix Wetness: 2 (much lower scaling, reduces shiny/wet look)
             exp_scale = nodes.new('ShaderNodeMath')
             exp_scale.operation = 'MULTIPLY'
             exp_scale.location = (tex_x + 350, tex_y)
-            exp_scale.inputs[1].default_value = 149.0
+            exp_scale.inputs[1].default_value = 2.0 if props.fix_wetness else 149.0
+            exp_scale.label = "Exp Scale" + (" (Fixed)" if props.fix_wetness else "")
             links.new(sep_rgb.outputs['Red'], exp_scale.inputs[0])
             
             exp_add = nodes.new('ShaderNodeMath')
@@ -1161,6 +1279,36 @@ def apply_vlg_material(material, props):
         emission_output = add_rim.outputs[0]
     else:
         emission_output = emission.outputs[0]
+    
+    # -------------------------------------------------------------------------
+    # LIGHTWARP FILL LIGHT (adds to emission for softer shadows)
+    # -------------------------------------------------------------------------
+    if lightwarp_emission_node:
+        color_node, strength_node = lightwarp_emission_node
+        
+        # Create emission shader for lightwarp fill light
+        lightwarp_emission = nodes.new('ShaderNodeEmission')
+        lightwarp_emission.location = (750, -500)
+        lightwarp_emission.label = "Lightwarp Fill"
+        
+        # Connect color (from base texture or warp texture)
+        if hasattr(color_node, 'outputs'):
+            if 'Color' in color_node.outputs:
+                links.new(color_node.outputs['Color'], lightwarp_emission.inputs['Color'])
+            else:
+                links.new(color_node.outputs[0], lightwarp_emission.inputs['Color'])
+        
+        links.new(strength_node.outputs['Value'], lightwarp_emission.inputs['Strength'])
+        
+        # Add lightwarp fill to existing emission
+        add_lightwarp = nodes.new('ShaderNodeAddShader')
+        add_lightwarp.location = (900, -400)
+        add_lightwarp.label = "Add Lightwarp"
+        links.new(emission_output, add_lightwarp.inputs[0])
+        links.new(lightwarp_emission.outputs['Emission'], add_lightwarp.inputs[1])
+        
+        emission_output = add_lightwarp.outputs[0]
+        print(f"[SHADER] Lightwarp fill light connected")
     
     # -------------------------------------------------------------------------
     # COMBINE SHADERS (Diffuse + Envmap + Emission)
@@ -2513,6 +2661,9 @@ class VLG_PT_MiscPanel(Panel):
         layout.prop(props, "halflambert")
         layout.prop(props, "nocull")
         layout.prop(props, "model")
+        
+        layout.separator()
+        layout.prop(props, "fix_wetness")
 
 
 # ============================================================================

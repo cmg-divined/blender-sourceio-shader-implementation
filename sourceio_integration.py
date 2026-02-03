@@ -73,10 +73,16 @@ except ImportError as e:
     logger = FallbackLogger()
 
 
-def import_materials_vlg(content_manager: ContentManager, mdl, base_path: str):
+def import_materials_vlg(content_manager: ContentManager, mdl, base_path: str, fix_wetness: bool = False):
     """
     Import materials using our VLG shader instead of SourceIO's.
     This replaces SourceIO's import_materials function.
+    
+    Args:
+        content_manager: SourceIO content manager
+        mdl: MDL model data
+        base_path: Base path for resolving textures
+        fix_wetness: If True, reduces phong exponent scaling to prevent shiny/wet appearance
     """
     try:
         # Import our VLG module
@@ -188,8 +194,11 @@ def import_materials_vlg(content_manager: ContentManager, mdl, base_path: str):
         # Parse VMT with content manager for texture resolution
         parse_vmt_with_cm(vmt_content, props, content_manager, vmt_dir, base_path)
         
+        # Apply fix_wetness option from import dialog
+        props.fix_wetness = fix_wetness
+        
         # Debug: Log material properties before applying
-        logger.info(f"[VLG] Material {material.name}: translucent={props.translucent}, alphatest={props.alphatest}")
+        logger.info(f"[VLG] Material {material.name}: translucent={props.translucent}, alphatest={props.alphatest}, fix_wetness={props.fix_wetness}")
         
         # Apply our VLG shader
         try:
@@ -545,6 +554,11 @@ if SOURCEIO_AVAILABLE:
         bl_options = {'UNDO'}
 
         discover_resources: BoolProperty(name="Mount discovered content", default=True)
+        fix_wetness: BoolProperty(
+            name="Fix Wetness",
+            description="Reduces phong exponent scaling to prevent overly shiny/wet appearance",
+            default=False
+        )
         filter_glob: StringProperty(default="*.mdl;*.md3", options={'HIDDEN'})
 
         def execute(self, context):
@@ -579,7 +593,7 @@ if SOURCEIO_AVAILABLE:
                         
                         # Import materials with OUR VLG shader
                         if self.import_textures:
-                            import_materials_vlg(content_manager, mdl, base_path)
+                            import_materials_vlg(content_manager, mdl, base_path, fix_wetness=self.fix_wetness)
                         
                         # Import the model geometry
                         container = import_mdl49_model(content_manager, mdl, vtx, vvd, 
