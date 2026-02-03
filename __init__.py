@@ -796,6 +796,20 @@ def apply_vlg_material(material, props):
     principled.inputs['Metallic'].default_value = 0.0
     
     # -------------------------------------------------------------------------
+    # $phongalbedotint - Tint specular by base texture color
+    # -------------------------------------------------------------------------
+    if props.phongalbedotint:
+        # Specular Tint controls the color of specular reflections
+        # In Blender 4.x+, this is a color input (RGB)
+        # Setting it to the base color tints specular by the texture
+        if 'Specular Tint' in principled.inputs:
+            # Specular Tint is a color in Blender 4.x/5.x
+            # We'll connect it to the base texture later if available
+            # For now, set a neutral tint that will be multiplied
+            principled.inputs['Specular Tint'].default_value = (1.0, 1.0, 1.0, 1.0)
+            print(f"[SHADER] Phong albedo tint enabled - will connect to base texture")
+    
+    # -------------------------------------------------------------------------
     # $phongfresnelranges - Modulate specular based on viewing angle
     # -------------------------------------------------------------------------
     # Implementation based on SourceIO's node group (reverse-engineered).
@@ -1038,6 +1052,17 @@ def apply_vlg_material(material, props):
                 
                 links.new(base_tex.outputs['Color'], mix_color.inputs['A'])
                 links.new(mix_color.outputs['Result'], principled.inputs['Base Color'])
+            
+            # $phongalbedotint - connect base texture to Specular Tint
+            if props.phongalbedotint and 'Specular Tint' in principled.inputs:
+                # Apply gamma correction like SourceIO does (0.4545 = 1/2.2)
+                gamma_node = nodes.new('ShaderNodeGamma')
+                gamma_node.location = (tex_x + 400, tex_y - 150)
+                gamma_node.inputs['Gamma'].default_value = 0.4545
+                gamma_node.label = "Albedo Tint Gamma"
+                links.new(base_tex.outputs['Color'], gamma_node.inputs['Color'])
+                links.new(gamma_node.outputs['Color'], principled.inputs['Specular Tint'])
+                print(f"[SHADER] Connected base texture to Specular Tint (phongalbedotint)")
             
             tex_y -= 300
         else:
@@ -1450,13 +1475,14 @@ def apply_vlg_material(material, props):
         links.new(rim_max.outputs['Value'], rim_boost.inputs[0])
         
         # Rim mask from phong exponent texture alpha (if enabled)
-        if props.rimmask and props.phongexponenttexture:
+        if props.rimmask and phong_tex_node:
             rim_mask_mult = nodes.new('ShaderNodeMath')
             rim_mask_mult.operation = 'MULTIPLY'
             rim_mask_mult.location = (1150, -400)
             rim_mask_mult.label = "× Rim Mask"
             links.new(rim_boost.outputs['Value'], rim_mask_mult.inputs[0])
-            # The rim mask connection will be made when loading the phongexponenttexture
+            # Connect phong exponent texture alpha as rim mask
+            links.new(phong_tex_node.outputs['Alpha'], rim_mask_mult.inputs[1])
             rim_final = rim_mask_mult
         else:
             rim_final = rim_boost
@@ -1750,6 +1776,97 @@ def apply_vlg_material(material, props):
     if props.nocull and (props.translucent or props.alphatest):
         if hasattr(material, 'show_transparent_back'):
             material.show_transparent_back = True
+    
+    # -------------------------------------------------------------------------
+    # ARRANGE NODES FOR CLEAN LAYOUT
+    # -------------------------------------------------------------------------
+    arrange_nodes(nodes, output)
+
+
+def arrange_nodes(nodes, output_node):
+    """Arrange shader nodes in a clean, organized layout.
+    
+    Organizes nodes from right to left based on their connection depth
+    from the output node, with consistent spacing.
+    """
+    NODE_WIDTH = 250
+    NODE_HEIGHT = 200
+    COLUMN_SPACING = 300
+    ROW_SPACING = 250
+    
+    # Calculate depth of each node (distance from output)
+    depths = {}
+    
+    def get_depth(node, current_depth=0):
+        if node.name in depths:
+            # Take the maximum depth if visited from multiple paths
+            depths[node.name] = max(depths[node.name], current_depth)
+            return
+        depths[node.name] = current_depth
+        
+        # Traverse inputs
+        for input_socket in node.inputs:
+            for link in input_socket.links:
+                get_depth(link.from_node, current_depth + 1)
+    
+    # Start from output
+    get_depth(output_node, 0)
+    
+    # Group nodes by depth
+    columns = {}
+    for node_name, depth in depths.items():
+        if depth not in columns:
+            columns[depth] = []
+        columns[depth].append(node_name)
+    
+    # Position nodes
+    max_depth = max(depths.values()) if depths else 0
+    
+    for depth, node_names in columns.items():
+        # X position: output on right, inputs on left
+        x = (max_depth - depth) * -COLUMN_SPACING
+        
+        # Sort nodes in column by type for consistency
+        def sort_key(name):
+            node = nodes.get(name)
+            if not node:
+                return (999, name)
+            type_order = {
+                'OUTPUT_MATERIAL': 0,
+                'BSDF_PRINCIPLED': 1,
+                'MIX_SHADER': 2,
+                'ADD_SHADER': 3,
+                'EMISSION': 4,
+                'TEX_IMAGE': 10,
+                'NORMAL_MAP': 11,
+                'VECT_MATH': 20,
+                'MATH': 21,
+                'MIX': 22,
+                'CLAMP': 23,
+                'NEW_GEOMETRY': 30,
+                'FRESNEL': 31,
+            }
+            return (type_order.get(node.type, 50), name)
+        
+        node_names.sort(key=sort_key)
+        
+        # Y position: stack vertically, centered
+        total_height = len(node_names) * ROW_SPACING
+        start_y = total_height / 2
+        
+        for i, node_name in enumerate(node_names):
+            node = nodes.get(node_name)
+            if node:
+                node.location.x = x
+                node.location.y = start_y - (i * ROW_SPACING)
+    
+    # Handle any unconnected nodes (textures at the left)
+    unconnected = [n for n in nodes if n.name not in depths]
+    if unconnected:
+        x = (max_depth + 1) * -COLUMN_SPACING
+        for i, node in enumerate(unconnected):
+            node.location.x = x
+            node.location.y = 400 - (i * ROW_SPACING)
 
 
 # ============================================================================
