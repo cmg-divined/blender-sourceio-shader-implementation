@@ -1,4 +1,4 @@
-<img width="2827" height="1011" alt="image" src="https://github.com/user-attachments/assets/b3bdea73-f88b-40cc-bc4a-1f76f75523b3" />
+<img width="2988" height="988" alt="image" src="https://github.com/user-attachments/assets/761b0c52-3216-48bf-9cae-204736c94a2c" />
 
 # Blender VertexLitGeneric Shader
 
@@ -88,6 +88,7 @@ In the Material Properties panel, click "Import VMT" to load material settings f
 ## License
 
 MIT License
+
 
 
 
