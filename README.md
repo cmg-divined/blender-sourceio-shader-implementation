@@ -1,3 +1,5 @@
+<img width="2827" height="1011" alt="image" src="https://github.com/user-attachments/assets/b3bdea73-f88b-40cc-bc4a-1f76f75523b3" />
+
 # Blender VertexLitGeneric Shader
 
 A Blender addon that replicates Source Engine's VertexLitGeneric shader for imported models. This allows Source 1 models (from Garry's Mod, Half-Life 2, Counter-Strike: Source, etc.) to render with accurate materials in Blender.
@@ -86,6 +88,7 @@ In the Material Properties panel, click "Import VMT" to load material settings f
 ## License
 
 MIT License
+
 
 
 
