@@ -1873,7 +1873,8 @@ def parse_vmt(content, props, base_path=""):
     parsed_values = {}
     
     # Pattern for: "$key" "value" or "$key" "[1 2 3]"
-    pattern1 = r'"\$(\w+)"\s+"([^"]*)"'
+    # Note: \s* allows zero or more whitespace (some VMTs have no space like "$key""value")
+    pattern1 = r'"\$(\w+)"\s*"([^"]*)"'
     for match in re.finditer(pattern1, content_no_comments, re.IGNORECASE):
         key = match.group(1).lower()
         value = match.group(2)
@@ -1881,7 +1882,7 @@ def parse_vmt(content, props, base_path=""):
         print(f"  [PARSED] ${key} = \"{value}\"")
     
     # Pattern for: "$key" "[1 2 3]" (vector in separate brackets)
-    pattern2 = r'"\$(\w+)"\s+"\[([^\]]*)\]"'
+    pattern2 = r'"\$(\w+)"\s*"\[([^\]]*)\]"'
     for match in re.finditer(pattern2, content_no_comments, re.IGNORECASE):
         key = match.group(1).lower()
         value = match.group(2)

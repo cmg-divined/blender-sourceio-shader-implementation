@@ -388,7 +388,8 @@ def parse_vmt_with_cm(vmt_content: str, props, content_manager: ContentManager, 
             in_proxies = False
         
         # Match key-value pairs: "$key" "value" or $key value
-        match = re.match(r'["\']?\$?(\w+)["\']?\s+["\']?([^"\']+)["\']?', line, re.IGNORECASE)
+        # Note: \s* allows zero or more whitespace (some VMTs have no space like "$key""value")
+        match = re.match(r'["\']?\$?(\w+)["\']?\s*["\']?([^"\']+)["\']?', line, re.IGNORECASE)
         if not match:
             continue
         
