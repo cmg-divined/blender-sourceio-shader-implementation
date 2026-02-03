@@ -169,10 +169,14 @@ def import_materials_vlg(content_manager: ContentManager, mdl, base_path: str, f
         mat = get_or_create_material(material.name, material_path.as_posix())
         material_mapper[material.material_pointer] = mat
         
-        # Check if already loaded with VLG
+        # Check if already loaded with VLG - but force rebuild if fix_wetness changed
         if mat.get('vlg_loaded', False):
-            logger.info(f"[VLG] Skipping {mat.name} - already loaded")
-            continue
+            cached_fix_wetness = mat.get('vlg_fix_wetness', False)
+            if cached_fix_wetness == fix_wetness:
+                logger.info(f"[VLG] Skipping {mat.name} - already loaded with same settings")
+                continue
+            else:
+                logger.info(f"[VLG] Rebuilding {mat.name} - fix_wetness changed from {cached_fix_wetness} to {fix_wetness}")
         
         # Read the VMT content
         try:
@@ -204,6 +208,7 @@ def import_materials_vlg(content_manager: ContentManager, mdl, base_path: str, f
         try:
             apply_vlg_material(mat, props)
             mat['vlg_loaded'] = True
+            mat['vlg_fix_wetness'] = fix_wetness  # Track fix_wetness for cache invalidation
             # Store actual disk path if available, otherwise store relative path
             mat['vlg_vmt_path'] = vmt_disk_path if vmt_disk_path else str(vmt_path)
             
